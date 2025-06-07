@@ -1,13 +1,20 @@
 #!/usr/bin/env bun
 
-import { describe, test, expect, afterEach } from "bun:test";
-import { setupOAuthCredentials } from "../src/setup-oauth";
+import { describe, test, expect, afterEach, beforeEach } from "bun:test";
+import { setupOAuthCredentials, isTokenExpired } from "../src/setup-oauth";
 import { readFile, unlink, access } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 
 describe("setupOAuthCredentials", () => {
   const credentialsPath = join(homedir(), ".claude", ".credentials.json");
+  
+  beforeEach(() => {
+    // Mock fetch to prevent actual API calls
+    global.fetch = async () => {
+      throw new Error("Mock fetch - should not be called");
+    };
+  });
 
   afterEach(async () => {
     // Clean up the credentials file after each test
@@ -18,11 +25,14 @@ describe("setupOAuthCredentials", () => {
     }
   });
 
-  test("should create credentials file with correct structure", async () => {
+  test("should create credentials file with correct structure for valid token", async () => {
+    // Use a future timestamp to avoid token refresh
+    const futureTimestamp = String(Math.floor(Date.now() / 1000) + 3600); // 1 hour from now
+    
     const credentials = {
       accessToken: "test-access-token",
       refreshToken: "test-refresh-token",
-      expiresAt: "1234567890",
+      expiresAt: futureTimestamp,
     };
 
     await setupOAuthCredentials(credentials);
@@ -38,17 +48,19 @@ describe("setupOAuthCredentials", () => {
       claudeAiOauth: {
         accessToken: "test-access-token",
         refreshToken: "test-refresh-token",
-        expiresAt: 1234567890,
+        expiresAt: parseInt(futureTimestamp),
         scopes: ["user:inference", "user:profile"],
       },
     });
   });
 
   test("should convert expiresAt string to number", async () => {
+    const futureTimestamp = String(Math.floor(Date.now() / 1000) + 3600);
+    
     const credentials = {
       accessToken: "test-access-token",
       refreshToken: "test-refresh-token",
-      expiresAt: "9876543210",
+      expiresAt: futureTimestamp,
     };
 
     await setupOAuthCredentials(credentials);
@@ -57,22 +69,25 @@ describe("setupOAuthCredentials", () => {
     const parsed = JSON.parse(content);
 
     expect(typeof parsed.claudeAiOauth.expiresAt).toBe("number");
-    expect(parsed.claudeAiOauth.expiresAt).toBe(9876543210);
+    expect(parsed.claudeAiOauth.expiresAt).toBe(parseInt(futureTimestamp));
   });
 
   test("should overwrite existing credentials file", async () => {
+    const futureTimestamp1 = String(Math.floor(Date.now() / 1000) + 3600);
+    const futureTimestamp2 = String(Math.floor(Date.now() / 1000) + 7200);
+    
     // Create initial credentials
     await setupOAuthCredentials({
       accessToken: "old-token",
       refreshToken: "old-refresh",
-      expiresAt: "1111111111",
+      expiresAt: futureTimestamp1,
     });
 
     // Overwrite with new credentials
     await setupOAuthCredentials({
       accessToken: "new-token",
       refreshToken: "new-refresh",
-      expiresAt: "2222222222",
+      expiresAt: futureTimestamp2,
     });
 
     const content = await readFile(credentialsPath, "utf-8");
@@ -80,21 +95,72 @@ describe("setupOAuthCredentials", () => {
 
     expect(parsed.claudeAiOauth.accessToken).toBe("new-token");
     expect(parsed.claudeAiOauth.refreshToken).toBe("new-refresh");
-    expect(parsed.claudeAiOauth.expiresAt).toBe(2222222222);
+    expect(parsed.claudeAiOauth.expiresAt).toBe(parseInt(futureTimestamp2));
   });
 
   test("should create .claude directory if it doesn't exist", async () => {
-    // This test is implicitly covered by the other tests, but we can verify
-    // that the function doesn't fail even when the directory doesn't exist
+    const futureTimestamp = String(Math.floor(Date.now() / 1000) + 3600);
+    
     const credentials = {
       accessToken: "test-token",
       refreshToken: "test-refresh",
-      expiresAt: "1234567890",
+      expiresAt: futureTimestamp,
     };
 
     await setupOAuthCredentials(credentials);
 
     // Verify file was created
     await access(credentialsPath);
+  });
+
+  test("should refresh expired token", async () => {
+    const expiredTimestamp = String(Math.floor(Date.now() / 1000) - 3600); // 1 hour ago
+    
+    // Mock successful token refresh
+    global.fetch = async (url: string) => {
+      if (url === "https://claude.ai/api/oauth/token") {
+        return {
+          ok: true,
+          json: async () => ({
+            access_token: "new-access-token",
+            refresh_token: "new-refresh-token", 
+            expires_in: 3600,
+          }),
+        } as Response;
+      }
+      throw new Error("Unexpected URL");
+    };
+    
+    const credentials = {
+      accessToken: "expired-token",
+      refreshToken: "test-refresh-token",
+      expiresAt: expiredTimestamp,
+    };
+
+    await setupOAuthCredentials(credentials);
+
+    const content = await readFile(credentialsPath, "utf-8");
+    const parsed = JSON.parse(content);
+
+    expect(parsed.claudeAiOauth.accessToken).toBe("new-access-token");
+    expect(parsed.claudeAiOauth.refreshToken).toBe("new-refresh-token");
+    expect(parsed.claudeAiOauth.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+});
+
+describe("isTokenExpired", () => {
+  test("should return true for expired token", () => {
+    const pastTimestamp = Math.floor(Date.now() / 1000) - 3600; // 1 hour ago
+    expect(isTokenExpired(pastTimestamp)).toBe(true);
+  });
+
+  test("should return true for token expiring soon (within buffer)", () => {
+    const soonTimestamp = Math.floor(Date.now() / 1000) + 60; // 1 minute from now (within 5-minute buffer)
+    expect(isTokenExpired(soonTimestamp)).toBe(true);
+  });
+
+  test("should return false for valid token", () => {
+    const futureTimestamp = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
+    expect(isTokenExpired(futureTimestamp)).toBe(false);
   });
 });
